@@ -216,23 +216,27 @@ def extract_file(path: Path, root: Path) -> ParsedFile:
 
 # ── directory walk ────────────────────────────────────────────────────────────
 
-def extract_repo(repo_root: str, exclude: Optional[set] = None) -> list[ParsedFile]:
+def extract_repo(repo_root: str, exclude: Optional[set] = None, typescript: bool = True) -> list[ParsedFile]:
     """
-    Walk repo_root, parse every .py file, return list of ParsedFile.
+    Walk repo_root, parse every .py (and optionally .ts/.tsx) file.
     Skips hidden dirs, __pycache__, and anything in `exclude`.
     """
-    root    = Path(repo_root).resolve()
-    skip    = (exclude or set()) | {"__pycache__", ".git", ".venv", "venv", "node_modules"}
+    from extractor_ts import extract_ts_repo
+
+    root = Path(repo_root).resolve()
+    skip = (exclude or set()) | {"__pycache__", ".git", ".venv", "venv", "node_modules"}
     results = []
 
     for py_file in sorted(root.rglob("*.py")):
-        # skip hidden / excluded dirs
         if any(part.startswith(".") or part in skip for part in py_file.parts):
             continue
         try:
             results.append(extract_file(py_file, root))
         except Exception as exc:
             print(f"  [warn] skipping {py_file}: {exc}")
+
+    if typescript:
+        results.extend(extract_ts_repo(repo_root, exclude=exclude))
 
     return results
 
