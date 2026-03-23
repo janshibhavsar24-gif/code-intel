@@ -6,6 +6,7 @@ Tools:
   analyze_repo   — coupling scores + dead code report (single or multi-repo)
   change_impact  — blast radius for a given node ID (single or multi-repo)
   find_usages    — all call sites of a symbol across one or more repos
+  explain_code   — plain-English walkthrough of a file or line range
 
 Transport: stdio (works with Claude Desktop, Cursor, VS Code + MCP extension)
 
@@ -337,6 +338,84 @@ def _tool_find_usages(repo_paths: list[str], symbol: str) -> str:
     return "\n\n---\n\n".join(sections)
 
 
+def _tool_explain_code(repo_path: str, file_path: str,
+                       start_line: int | None, end_line: int | None) -> str:
+    root     = Path(repo_path).resolve()
+    abs_path = (root / file_path).resolve()
+
+    if not abs_path.exists():
+        # try interpreting file_path as already absolute
+        abs_path = Path(file_path).resolve()
+    if not abs_path.exists():
+        return f"File not found: `{file_path}` (looked in {root})"
+
+    all_lines = abs_path.read_text(errors="replace").splitlines()
+    total     = len(all_lines)
+
+    # normalise line range (1-indexed, inclusive)
+    s = max(1, start_line or 1)
+    e = min(total, end_line or total)
+    snippet   = "\n".join(f"{s + i:>5}  {ln}" for i, ln in enumerate(all_lines[s - 1 : e]))
+
+    # relative path for graph lookup
+    try:
+        rel = str(abs_path.relative_to(root))
+    except ValueError:
+        rel = abs_path.name
+
+    # pull graph neighbours that overlap the requested range for extra context
+    graph_context = ""
+    try:
+        G, node_map = _load_graph(repo_path)
+        overlapping = [
+            n for n in node_map.values()
+            if n.file == rel and n.start_line <= e and n.end_line >= s
+        ]
+        if overlapping:
+            neighbor_ids: set[str] = set()
+            for n in overlapping:
+                neighbor_ids.update(G.predecessors(n.id))
+                neighbor_ids.update(G.successors(n.id))
+            neighbor_ids -= {n.id for n in overlapping}
+
+            parts = []
+            for nid in list(neighbor_ids)[:8]:   # cap at 8 neighbours
+                nb = node_map.get(nid)
+                if nb:
+                    parts.append(
+                        f"// {nb.kind.value} {nb.name}  ({nb.file}:{nb.start_line})\n"
+                        f"{nb.source[:800]}"
+                    )
+            if parts:
+                graph_context = "\n\n---\nRelated code (callers / callees):\n\n" + "\n\n".join(parts)
+    except Exception:
+        pass   # graph context is best-effort
+
+    range_desc = f"lines {s}–{e}" if (start_line or end_line) else "entire file"
+    label      = rel
+
+    client = anthropic.Anthropic()
+    msg = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1536,
+        system=(
+            "You are a code explanation assistant. Given a code snippet and optional "
+            "context about its callers and callees, produce a clear plain-English walkthrough. "
+            "Cover: what it does, how it works step by step, key design decisions, "
+            "and how it connects to the surrounding code. Be concrete — use names and line numbers."
+        ),
+        messages=[{
+            "role": "user",
+            "content": (
+                f"File: {label}  ({range_desc})\n\n"
+                f"```\n{snippet}\n```"
+                f"{graph_context}"
+            ),
+        }],
+    )
+    return msg.content[0].text
+
+
 # ── MCP tool registry ─────────────────────────────────────────────────────────
 
 _REPO_PATHS_SCHEMA = {
@@ -442,6 +521,37 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["symbol"],
             },
         ),
+        types.Tool(
+            name="explain_code",
+            description=(
+                "Produce a plain-English walkthrough of a file or specific line range. "
+                "Automatically enriches the explanation with graph context: "
+                "what the code calls and what calls it. "
+                "Omit start_line/end_line to explain the entire file."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Absolute path to the repo root.",
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Relative path to the file within the repo, e.g. 'backend/routes/watchlist.py'.",
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "First line to explain (1-indexed, inclusive). Omit for start of file.",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Last line to explain (1-indexed, inclusive). Omit for end of file.",
+                    },
+                },
+                "required": ["repo_path", "file_path"],
+            },
+        ),
     ]
 
 
@@ -466,6 +576,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         repo_paths = _normalize_repo_paths(arguments)
         symbol     = arguments["symbol"]
         result     = await asyncio.to_thread(_tool_find_usages, repo_paths, symbol)
+
+    elif name == "explain_code":
+        repo_path  = arguments["repo_path"]
+        file_path  = arguments["file_path"]
+        start_line = arguments.get("start_line")
+        end_line   = arguments.get("end_line")
+        result     = await asyncio.to_thread(_tool_explain_code, repo_path, file_path, start_line, end_line)
 
     else:
         result = f"Unknown tool: {name}"
