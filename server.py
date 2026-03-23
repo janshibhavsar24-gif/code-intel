@@ -8,7 +8,8 @@ Tools:
   find_usages    — all call sites of a symbol across one or more repos
   explain_code   — plain-English walkthrough of a file or line range
   coverage_hints — identify untested files and functions
-  find_similar   — find semantically similar code via vector embeddings
+  find_similar      — find semantically similar code via vector embeddings
+  complexity_report — cyclomatic complexity ranked by risk
 
 Transport: stdio (works with Claude Desktop, Cursor, VS Code + MCP extension)
 
@@ -492,6 +493,77 @@ def _tool_find_similar(repo_paths: list[str], db_paths: list[str],
     return "\n\n---\n\n".join(sections)
 
 
+# ── cyclomatic complexity ─────────────────────────────────────────────────────
+
+# Decision-point keywords / tokens that add a branch, per language
+_PY_BRANCH  = re.compile(r'\b(if|elif|for|while|except|and|or|case)\b')
+_TS_BRANCH  = re.compile(r'\b(if|else\s+if|for|while|catch|case|switch)\b|&&|\|\||\?(?![\?:])')
+
+
+def _complexity(node) -> int:
+    """
+    Cyclomatic complexity ≈ 1 + number of branch-inducing tokens in source.
+    Uses a Python pattern for .py files, TypeScript pattern for .ts/.tsx.
+    """
+    is_ts = node.file.endswith((".ts", ".tsx"))
+    pat   = _TS_BRANCH if is_ts else _PY_BRANCH
+    return 1 + len(pat.findall(node.source))
+
+
+_RISK_HIGH   = 10   # CC > 10 → high risk, hard to test
+_RISK_MEDIUM = 5    # CC > 5  → moderate, worth reviewing
+
+
+def _tool_complexity_report(repo_paths: list[str], top_n: int) -> str:
+    sections = []
+
+    for repo_path in repo_paths:
+        label = Path(repo_path).name
+        try:
+            _, node_map = _load_graph(repo_path)
+        except Exception as exc:
+            sections.append(f"## {label}\nFailed to load repo: {exc}\n")
+            continue
+
+        # compute complexity for every function / method
+        scored = [
+            (n, _complexity(n))
+            for n in node_map.values()
+            if n.kind.value in ("function", "method")
+            and not _TEST_PAT.search(n.file)
+        ]
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        high   = [(n, c) for n, c in scored if c > _RISK_HIGH]
+        medium = [(n, c) for n, c in scored if _RISK_MEDIUM < c <= _RISK_HIGH]
+        avg    = sum(c for _, c in scored) / len(scored) if scored else 0
+
+        lines = [
+            f"## {label}\n",
+            f"Functions/methods analysed : {len(scored)}",
+            f"Average complexity          : {avg:.1f}",
+            f"High risk  (CC > {_RISK_HIGH})     : {len(high)}",
+            f"Medium risk (CC > {_RISK_MEDIUM})      : {len(medium)}",
+        ]
+
+        lines.append(f"\n### Top {top_n} most complex functions\n")
+        lines.append(f"{'CC':<5} {'Risk':<8} {'Kind':<8} {'Name':<35} Location")
+        lines.append("-" * 80)
+
+        for n, cc in scored[:top_n]:
+            risk = "🔴 HIGH  " if cc > _RISK_HIGH else ("🟡 MEDIUM" if cc > _RISK_MEDIUM else "🟢 OK    ")
+            lines.append(f"{cc:<5} {risk}  {n.kind.value:<8} {n.name:<35} {n.file}:{n.start_line}")
+
+        if high:
+            lines.append(f"\n### All high-risk functions (CC > {_RISK_HIGH})\n")
+            for n, cc in high:
+                lines.append(f"  CC={cc:<4} {n.file}:{n.start_line:<6} {n.kind.value}  {n.name}")
+
+        sections.append("\n".join(lines))
+
+    return "\n\n---\n\n".join(sections)
+
+
 # test file pattern — matches common conventions across Python and TS/TSX
 _TEST_PAT = re.compile(
     r"(^|/)test_|_test\.(py|ts|tsx)$"
@@ -776,6 +848,26 @@ async def list_tools() -> list[types.Tool]:
                 },
             },
         ),
+        types.Tool(
+            name="complexity_report",
+            description=(
+                "Compute cyclomatic complexity for every function and method in one or more repos. "
+                "Ranks by complexity and flags high-risk (CC > 10) and medium-risk (CC > 5) code. "
+                "High complexity + no tests (from coverage_hints) = highest refactor priority. "
+                "Works on Python and TypeScript/TSX. Does not require embed.py."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_paths": _REPO_PATHS_SCHEMA,
+                    "repo_path":  {"type": "string", "description": "Alias for repo_paths (single repo)."},
+                    "top_n": {
+                        "type": "integer",
+                        "description": "How many functions to show in the ranked table (default: 20).",
+                    },
+                },
+            },
+        ),
     ]
 
 
@@ -819,6 +911,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         snippet    = arguments.get("snippet")
         top_k      = int(arguments.get("top_k", 8))
         result     = await asyncio.to_thread(_tool_find_similar, repo_paths, db_paths, symbol, snippet, top_k)
+
+    elif name == "complexity_report":
+        repo_paths = _normalize_repo_paths(arguments)
+        top_n      = int(arguments.get("top_n", 20))
+        result     = await asyncio.to_thread(_tool_complexity_report, repo_paths, top_n)
 
     else:
         result = f"Unknown tool: {name}"
