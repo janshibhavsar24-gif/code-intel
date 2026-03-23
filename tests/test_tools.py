@@ -13,6 +13,7 @@ from server import (
     _tool_coverage_hints,
     _tool_explain_code,
     _tool_find_similar,
+    _tool_generate_tests,
     _tool_find_usages,
     _normalize_repo_paths,
     _normalize_db_paths,
@@ -288,3 +289,63 @@ class TestFindSimilar:
     def test_no_symbol_or_snippet_returns_error(self):
         result = _tool_find_similar([FIXTURES], ["./chroma_db"], symbol=None, snippet=None, top_k=5)
         assert "Provide" in result
+
+
+class TestGenerateTests:
+    @patch("server.anthropic.Anthropic")
+    def test_calls_claude_with_source(self, mock_anthropic):
+        mock_client = MagicMock()
+        mock_anthropic.return_value = mock_client
+        mock_client.messages.create.return_value = MagicMock(
+            content=[MagicMock(text="def test_bark(): assert bark() == 'woof'")]
+        )
+
+        result = _tool_generate_tests(FIXTURES, "bark", None)
+
+        assert mock_client.messages.create.called
+        assert "test_bark" in result
+
+    @patch("server.anthropic.Anthropic")
+    def test_prompt_includes_symbol_source(self, mock_anthropic):
+        mock_client = MagicMock()
+        mock_anthropic.return_value = mock_client
+        mock_client.messages.create.return_value = MagicMock(
+            content=[MagicMock(text="# tests")]
+        )
+
+        _tool_generate_tests(FIXTURES, "bark", None)
+
+        call_args = mock_client.messages.create.call_args
+        prompt = call_args.kwargs["messages"][0]["content"]
+        assert "bark" in prompt
+
+    @patch("server.anthropic.Anthropic")
+    def test_file_path_narrows_match(self, mock_anthropic):
+        mock_client = MagicMock()
+        mock_anthropic.return_value = mock_client
+        mock_client.messages.create.return_value = MagicMock(
+            content=[MagicMock(text="# tests")]
+        )
+
+        result = _tool_generate_tests(FIXTURES, "speak", "sample.py")
+
+        # should find it (not report multiple matches) since file is scoped
+        assert "multiple matches" not in result.lower()
+
+    def test_unknown_symbol_returns_error(self):
+        result = _tool_generate_tests(FIXTURES, "totally_nonexistent_xyz", None)
+        assert "not found" in result.lower()
+
+    @patch("server.anthropic.Anthropic")
+    def test_typescript_uses_jest_framework(self, mock_anthropic):
+        mock_client = MagicMock()
+        mock_anthropic.return_value = mock_client
+        mock_client.messages.create.return_value = MagicMock(
+            content=[MagicMock(text="describe('complexFn', () => {})")]
+        )
+
+        _tool_generate_tests(FIXTURES, "complexFn", None)
+
+        call_args = mock_client.messages.create.call_args
+        system_prompt = call_args.kwargs["system"]
+        assert "Jest" in system_prompt or "Vitest" in system_prompt

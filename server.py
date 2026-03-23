@@ -10,6 +10,7 @@ Tools:
   coverage_hints — identify untested files and functions
   find_similar      — find semantically similar code via vector embeddings
   complexity_report — cyclomatic complexity ranked by risk
+  generate_tests    — generate pytest/Jest test skeleton for a function or class
 
 Transport: stdio (works with Claude Desktop, Cursor, VS Code + MCP extension)
 
@@ -564,6 +565,83 @@ def _tool_complexity_report(repo_paths: list[str], top_n: int) -> str:
     return "\n\n---\n\n".join(sections)
 
 
+def _tool_generate_tests(repo_path: str, symbol: str, file_path: str | None) -> str:
+    try:
+        G, node_map = _load_graph(repo_path)
+    except Exception as exc:
+        return f"Failed to load repo: {exc}"
+
+    # Find matching nodes — prefer exact name match, optionally scoped to file
+    candidates = [
+        n for n in node_map.values()
+        if n.name == symbol
+        and n.kind.value in ("function", "method", "class")
+        and (file_path is None or file_path in n.file)
+    ]
+    if not candidates:
+        # fuzzy fallback
+        candidates = [
+            n for n in node_map.values()
+            if symbol in n.name
+            and n.kind.value in ("function", "method", "class")
+            and (file_path is None or file_path in n.file)
+        ]
+    if not candidates:
+        return f"Symbol `{symbol}` not found in repo."
+    if len(candidates) > 1 and file_path is None:
+        locs = "\n".join(f"  - {n.file}:{n.start_line}  {n.kind.value}  {n.name}" for n in candidates[:10])
+        return f"Multiple matches for `{symbol}`. Narrow with file_path:\n{locs}"
+
+    target = candidates[0]
+    is_ts  = target.file.endswith((".ts", ".tsx"))
+    framework = "Jest/Vitest" if is_ts else "pytest"
+    lang      = "TypeScript" if is_ts else "Python"
+
+    # Gather callers and callees for context
+    callers  = [node_map[nid] for nid in G.predecessors(target.id) if nid in node_map][:5]
+    callees  = [node_map[nid] for nid in G.successors(target.id)  if nid in node_map][:5]
+
+    context_parts = []
+    if callers:
+        context_parts.append("### Callers (how it is used)\n" +
+            "\n".join(f"// {n.file}:{n.start_line}\n{n.source[:400]}" for n in callers))
+    if callees:
+        context_parts.append("### Callees (what it calls)\n" +
+            "\n".join(f"// {n.file}:{n.start_line}\n{n.source[:400]}" for n in callees))
+
+    context_block = ("\n\n" + "\n\n".join(context_parts)) if context_parts else ""
+
+    cc = _complexity(target)
+
+    client = anthropic.Anthropic()
+    msg = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        system=(
+            f"You are an expert {lang} test writer. "
+            f"Generate a complete, runnable {framework} test file for the given code. "
+            "Requirements:\n"
+            "- Cover the happy path, edge cases, and error/boundary conditions\n"
+            "- Mock external dependencies (DB calls, HTTP, filesystem) where needed\n"
+            "- Use descriptive test names that explain what is being tested\n"
+            "- Include setup/teardown if needed\n"
+            "- Add a brief comment above each test explaining its purpose\n"
+            "- Output ONLY the test file code, no explanation outside the code"
+        ),
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Generate tests for this {lang} {target.kind.value}.\n"
+                f"File: {target.file}  lines: {target.start_line}-{target.end_line}  "
+                f"cyclomatic complexity: {cc}\n\n"
+                f"```{('typescript' if is_ts else 'python')}\n{target.source}\n```"
+                f"{context_block}"
+            ),
+        }],
+    )
+    return msg.content[0].text
+
+
 # test file pattern — matches common conventions across Python and TS/TSX
 _TEST_PAT = re.compile(
     r"(^|/)test_|_test\.(py|ts|tsx)$"
@@ -868,6 +946,34 @@ async def list_tools() -> list[types.Tool]:
                 },
             },
         ),
+        types.Tool(
+            name="generate_tests",
+            description=(
+                "Generate a complete, runnable pytest (Python) or Jest/Vitest (TypeScript) "
+                "test file for a given function or class. "
+                "Covers happy path, edge cases, and error conditions. "
+                "Automatically includes caller/callee context so mocks are accurate. "
+                "If multiple matches exist for the symbol, pass file_path to disambiguate."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Absolute path to the repo root.",
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Function, method, or class name to generate tests for.",
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Optional relative file path to disambiguate when symbol appears in multiple files.",
+                    },
+                },
+                "required": ["repo_path", "symbol"],
+            },
+        ),
     ]
 
 
@@ -916,6 +1022,12 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         repo_paths = _normalize_repo_paths(arguments)
         top_n      = int(arguments.get("top_n", 20))
         result     = await asyncio.to_thread(_tool_complexity_report, repo_paths, top_n)
+
+    elif name == "generate_tests":
+        repo_path = arguments["repo_path"]
+        symbol    = arguments["symbol"]
+        file_path = arguments.get("file_path")
+        result    = await asyncio.to_thread(_tool_generate_tests, repo_path, symbol, file_path)
 
     else:
         result = f"Unknown tool: {name}"
