@@ -5,6 +5,7 @@ Tools:
   ask_question   — hybrid vector+graph Q&A answered by Claude (single or multi-repo)
   analyze_repo   — coupling scores + dead code report (single or multi-repo)
   change_impact  — blast radius for a given node ID (single or multi-repo)
+  find_usages    — all call sites of a symbol across one or more repos
 
 Transport: stdio (works with Claude Desktop, Cursor, VS Code + MCP extension)
 
@@ -28,6 +29,7 @@ Or with uv (no venv activation needed):
 """
 import asyncio
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -266,6 +268,75 @@ def _tool_change_impact(repo_paths: list[str], node_id: str) -> str:
     return "\n\n---\n\n".join(sections)
 
 
+def _usages_in_node(node, symbol: str) -> list[tuple[int, str]]:
+    """
+    Scan a node's source for lines containing `symbol` as a whole word.
+    Returns (absolute_line_number, line_text) pairs.
+    """
+    pattern = re.compile(rf'\b{re.escape(symbol)}\b')
+    hits = []
+    for offset, line in enumerate(node.source.splitlines()):
+        if pattern.search(line):
+            hits.append((node.start_line + offset, line.rstrip()))
+    return hits
+
+
+def _tool_find_usages(repo_paths: list[str], symbol: str) -> str:
+    sections = []
+
+    for repo_path in repo_paths:
+        label = Path(repo_path).name
+        try:
+            G, node_map = _load_graph(repo_path)
+        except Exception as exc:
+            sections.append(f"## {label}\nFailed to load repo: {exc}\n")
+            continue
+
+        # 1. Graph pass — find nodes that have a CALLS/IMPORTS/INHERITS edge to any
+        #    node named `symbol`. These are the most reliable hits.
+        target_nids = {nid for nid, d in G.nodes(data=True) if d.get("name") == symbol}
+        graph_caller_nids: set[str] = set()
+        for target in target_nids:
+            graph_caller_nids.update(G.predecessors(target))
+
+        # 2. Text scan every node's source (whole-word match).
+        #    Graph callers are scanned first; remaining nodes fill in anything missed
+        #    (dynamic calls, import aliases, string references, etc.).
+        all_hits: set[tuple[str, int, str]] = set()
+        scanned: set[str] = set()
+
+        def scan(nid: str) -> None:
+            if nid not in node_map or nid in scanned:
+                return
+            scanned.add(nid)
+            node = node_map[nid]
+            for line_no, line_text in _usages_in_node(node, symbol):
+                all_hits.add((node.file, line_no, line_text))
+
+        for nid in graph_caller_nids:
+            scan(nid)
+        for nid in node_map:
+            scan(nid)
+
+        if not all_hits:
+            sections.append(f"## {label}\nNo usages of `{symbol}` found.\n")
+            continue
+
+        sorted_hits = sorted(all_hits, key=lambda x: (x[0], x[1]))
+
+        lines = [f"## {label} — {len(sorted_hits)} usage(s) of `{symbol}`\n"]
+        current_file = None
+        for file, line_no, line_text in sorted_hits:
+            if file != current_file:
+                lines.append(f"\n**{file}**")
+                current_file = file
+            lines.append(f"  {line_no:>5}  {line_text}")
+
+        sections.append("\n".join(lines))
+
+    return "\n\n---\n\n".join(sections)
+
+
 # ── MCP tool registry ─────────────────────────────────────────────────────────
 
 _REPO_PATHS_SCHEMA = {
@@ -352,6 +423,25 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["node_id"],
             },
         ),
+        types.Tool(
+            name="find_usages",
+            description=(
+                "Find every call site of a symbol (function, class, or method name) "
+                "across one or more repos. Returns file paths and exact line numbers grouped by file. "
+                "Uses a two-pass approach: graph edges identify likely callers first, "
+                "then a whole-word text scan catches anything the graph missed (imports, aliases, etc.). "
+                "Pass repo_paths as a list to search across multiple repos."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_paths": _REPO_PATHS_SCHEMA,
+                    "repo_path":  {"type": "string", "description": "Alias for repo_paths (single repo)."},
+                    "symbol":     {"type": "string", "description": "The symbol name to search for, e.g. 'resolve', 'CodeNode', 'extract_repo'."},
+                },
+                "required": ["symbol"],
+            },
+        ),
     ]
 
 
@@ -371,6 +461,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         repo_paths = _normalize_repo_paths(arguments)
         node_id    = arguments["node_id"]
         result     = await asyncio.to_thread(_tool_change_impact, repo_paths, node_id)
+
+    elif name == "find_usages":
+        repo_paths = _normalize_repo_paths(arguments)
+        symbol     = arguments["symbol"]
+        result     = await asyncio.to_thread(_tool_find_usages, repo_paths, symbol)
 
     else:
         result = f"Unknown tool: {name}"
