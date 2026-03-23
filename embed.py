@@ -1,11 +1,17 @@
 """
 embed.py — parse a repo and index every CodeNode into ChromaDB.
 
+Supports incremental indexing: only changed or new files are re-embedded,
+and nodes from deleted files are removed automatically.
+File hashes are stored in {db_path}/file_hashes.json.
+
 Usage:
   python embed.py /path/to/repo
   python embed.py /path/to/repo --db ./chroma_db --reset
 """
 import argparse
+import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -17,15 +23,66 @@ from resolve import resolve
 
 COLLECTION = "code_nodes"
 DEFAULT_DB  = "./chroma_db"
-BATCH_SIZE  = 100  # ChromaDB has per-call limits
+BATCH_SIZE  = 100
+HASH_FILE   = "file_hashes.json"
 
+
+# ── file hash helpers ─────────────────────────────────────────────────────────
+
+def _file_hash(path: Path) -> str:
+    return hashlib.md5(path.read_bytes()).hexdigest()
+
+
+def _load_hashes(db_path: str) -> dict[str, str]:
+    p = Path(db_path) / HASH_FILE
+    if p.exists():
+        return json.loads(p.read_text())
+    return {}
+
+
+def _save_hashes(db_path: str, hashes: dict[str, str]) -> None:
+    Path(db_path).mkdir(parents=True, exist_ok=True)
+    (Path(db_path) / HASH_FILE).write_text(json.dumps(hashes, indent=2))
+
+
+# ── ChromaDB helpers ──────────────────────────────────────────────────────────
+
+def _ids_for_file(collection, rel_path: str) -> list[str]:
+    """Return all node IDs currently indexed for a given relative file path."""
+    result = collection.get(where={"file": rel_path})
+    return result["ids"]
+
+
+def _remove_file_nodes(collection, rel_path: str) -> int:
+    ids = _ids_for_file(collection, rel_path)
+    if ids:
+        collection.delete(ids=ids)
+    return len(ids)
+
+
+# ── main indexer ──────────────────────────────────────────────────────────────
 
 def index(repo_path: str, db_path: str = DEFAULT_DB, reset: bool = False) -> None:
+    root = Path(repo_path).resolve()
+
     print(f"Parsing {repo_path} ...")
     files = extract_repo(repo_path)
     nodes, edges = resolve(files)
     print(f"  {len(nodes)} nodes  |  {len(edges)} edges")
 
+    # Build a map from relative file path → nodes in that file
+    file_to_nodes: dict[str, list] = {}
+    for n in nodes:
+        file_to_nodes.setdefault(n.file, []).append(n)
+
+    # Compute current hashes for every parsed source file
+    current_hashes: dict[str, str] = {}
+    for pf in files:
+        src_path = root / pf.path
+        if src_path.exists():
+            current_hashes[pf.path] = _file_hash(src_path)
+
+    # Set up ChromaDB
     client = chromadb.PersistentClient(path=db_path)
 
     if reset:
@@ -39,12 +96,43 @@ def index(repo_path: str, db_path: str = DEFAULT_DB, reset: bool = False) -> Non
 
     try:
         collection = client.get_collection(COLLECTION, embedding_function=ef)
-        print(f"  Using existing collection (add --reset to rebuild from scratch)")
+        print(f"  Using existing collection")
     except Exception:
         collection = client.create_collection(COLLECTION, embedding_function=ef)
         print(f"  Created new collection '{COLLECTION}'")
 
-    # Build text to embed: name + docstring + source (gives richer semantics than source alone)
+    # Load stored hashes (empty if reset or first run)
+    stored_hashes = {} if reset else _load_hashes(db_path)
+
+    # Classify files
+    changed  = [f for f, h in current_hashes.items() if stored_hashes.get(f) != h]
+    deleted  = [f for f in stored_hashes if f not in current_hashes]
+    skipped  = len(current_hashes) - len(changed)
+
+    print(f"  {len(changed)} changed/new  |  {len(deleted)} deleted  |  {skipped} unchanged")
+
+    # Remove nodes for deleted files
+    removed_total = 0
+    for rel_path in deleted:
+        removed_total += _remove_file_nodes(collection, rel_path)
+    if removed_total:
+        print(f"  Removed {removed_total} nodes from {len(deleted)} deleted file(s)")
+
+    # Re-index changed/new files
+    nodes_to_index = []
+    for rel_path in changed:
+        # Remove stale nodes for this file (if it was previously indexed)
+        if rel_path in stored_hashes:
+            _remove_file_nodes(collection, rel_path)
+        nodes_to_index.extend(file_to_nodes.get(rel_path, []))
+
+    if not nodes_to_index:
+        print("  Nothing to index — all files up to date.")
+        _save_hashes(db_path, current_hashes)
+        total = collection.count()
+        print(f"\nDone. {total} nodes in '{COLLECTION}' at {db_path}")
+        return
+
     def doc_text(n) -> str:
         parts = [f"{n.kind.value} {n.name}"]
         if n.docstring:
@@ -52,17 +140,9 @@ def index(repo_path: str, db_path: str = DEFAULT_DB, reset: bool = False) -> Non
         parts.append(n.source)
         return "\n".join(parts)
 
-    # Skip nodes already in the collection
-    existing = set(collection.get()["ids"])
-    new_nodes = [n for n in nodes if n.id not in existing]
-
-    if not new_nodes:
-        print("  Nothing new to index.")
-        return
-
-    print(f"  Indexing {len(new_nodes)} nodes ...")
-    for i in range(0, len(new_nodes), BATCH_SIZE):
-        batch = new_nodes[i : i + BATCH_SIZE]
+    print(f"  Indexing {len(nodes_to_index)} nodes ...")
+    for i in range(0, len(nodes_to_index), BATCH_SIZE):
+        batch = nodes_to_index[i : i + BATCH_SIZE]
         collection.add(
             ids       = [n.id for n in batch],
             documents = [doc_text(n) for n in batch],
@@ -77,8 +157,11 @@ def index(repo_path: str, db_path: str = DEFAULT_DB, reset: bool = False) -> Non
                 for n in batch
             ],
         )
-        done = min(i + BATCH_SIZE, len(new_nodes))
-        print(f"  {done}/{len(new_nodes)}")
+        done = min(i + BATCH_SIZE, len(nodes_to_index))
+        print(f"  {done}/{len(nodes_to_index)}")
+
+    # Persist updated hashes
+    _save_hashes(db_path, current_hashes)
 
     total = collection.count()
     print(f"\nDone. {total} nodes in '{COLLECTION}' at {db_path}")
@@ -86,10 +169,10 @@ def index(repo_path: str, db_path: str = DEFAULT_DB, reset: bool = False) -> Non
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Index a Python repo into ChromaDB")
+    p = argparse.ArgumentParser(description="Incrementally index a repo into ChromaDB")
     p.add_argument("repo",    help="Path to the repo to index")
     p.add_argument("--db",    default=DEFAULT_DB, help="ChromaDB storage directory")
-    p.add_argument("--reset", action="store_true", help="Wipe and rebuild the collection")
+    p.add_argument("--reset", action="store_true", help="Wipe and rebuild from scratch")
     args = p.parse_args()
 
     index(args.repo, args.db, args.reset)
