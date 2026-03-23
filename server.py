@@ -8,6 +8,7 @@ Tools:
   find_usages    — all call sites of a symbol across one or more repos
   explain_code   — plain-English walkthrough of a file or line range
   coverage_hints — identify untested files and functions
+  find_similar   — find semantically similar code via vector embeddings
 
 Transport: stdio (works with Claude Desktop, Cursor, VS Code + MCP extension)
 
@@ -417,6 +418,80 @@ def _tool_explain_code(repo_path: str, file_path: str,
     return msg.content[0].text
 
 
+def _tool_find_similar(repo_paths: list[str], db_paths: list[str],
+                       symbol: str | None, snippet: str | None,
+                       top_k: int) -> str:
+    if not symbol and not snippet:
+        return "Provide either `symbol` (a function/class name) or `snippet` (raw code)."
+
+    sections = []
+
+    for repo_path, db_path in zip(repo_paths, db_paths):
+        label = Path(repo_path).name
+        try:
+            _, node_map  = _load_graph(repo_path)
+            collection   = _load_collection(repo_path, db_path)
+        except Exception as exc:
+            sections.append(
+                f"## {label}\n"
+                f"Failed to load repo or collection: {exc}\n"
+                f"Make sure you have run: python embed.py {repo_path} --db {db_path}\n"
+            )
+            continue
+
+        # resolve query text
+        query_node_id: str | None = None
+        if symbol:
+            matches = [n for n in node_map.values() if n.name == symbol]
+            if not matches:
+                # fuzzy fallback
+                matches = [n for n in node_map.values() if symbol in n.name]
+            if not matches:
+                sections.append(f"## {label}\nSymbol `{symbol}` not found.\n")
+                continue
+            # prefer functions/methods over modules
+            matches.sort(key=lambda n: 0 if n.kind.value in ("function", "method") else 1)
+            query_node    = matches[0]
+            query_node_id = query_node.id
+            query_text    = f"{query_node.kind.value} {query_node.name}\n{query_node.source}"
+        else:
+            query_text = snippet  # type: ignore[assignment]
+
+        # query ChromaDB — fetch top_k + 1 to account for the query node itself
+        results = collection.query(
+            query_texts=[query_text],
+            n_results=min(top_k + 1, collection.count()),
+            include=["metadatas", "distances"],
+        )
+
+        ids       = results["ids"][0]
+        distances = results["distances"][0]
+        metas     = results["metadatas"][0]
+
+        lines = [f"## {label} — top {top_k} similar to `{symbol or 'snippet'}`\n"]
+        lines.append(f"{'#':<4} {'Score':<7} {'Kind':<10} {'Name':<30} Location")
+        lines.append("-" * 75)
+
+        rank = 0
+        for nid, dist, meta in zip(ids, distances, metas):
+            if nid == query_node_id:
+                continue   # skip the query node itself
+            # convert L2 distance → 0-1 similarity (1 = identical)
+            similarity = 1.0 / (1.0 + dist)
+            rank += 1
+            name     = meta.get("name", nid)
+            kind     = meta.get("kind", "?")
+            file     = meta.get("file", "?")
+            line     = meta.get("start_line", "?")
+            lines.append(f"{rank:<4} {similarity:.3f}   {kind:<10} {name:<30} {file}:{line}")
+            if rank >= top_k:
+                break
+
+        sections.append("\n".join(lines))
+
+    return "\n\n---\n\n".join(sections)
+
+
 # test file pattern — matches common conventions across Python and TS/TSX
 _TEST_PAT = re.compile(
     r"(^|/)test_|_test\.(py|ts|tsx)$"
@@ -669,6 +744,38 @@ async def list_tools() -> list[types.Tool]:
                 },
             },
         ),
+        types.Tool(
+            name="find_similar",
+            description=(
+                "Find semantically similar functions or classes using vector embeddings. "
+                "Given a symbol name or a raw code snippet, returns the most similar "
+                "code in the repo ranked by cosine similarity. "
+                "Useful for spotting duplication, finding prior art, or discovering "
+                "related implementations before writing new code. "
+                "Requires the repo to have been indexed with embed.py first."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_paths": _REPO_PATHS_SCHEMA,
+                    "repo_path":  {"type": "string", "description": "Alias for repo_paths (single repo)."},
+                    "symbol": {
+                        "type": "string",
+                        "description": "Name of a function or class to use as the similarity query.",
+                    },
+                    "snippet": {
+                        "type": "string",
+                        "description": "Raw code snippet to use as the similarity query (alternative to symbol).",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Number of similar results to return (default: 8).",
+                    },
+                    "db_paths": _DB_PATHS_SCHEMA,
+                    "db_path":  {"type": "string", "description": "Alias for db_paths (single repo)."},
+                },
+            },
+        ),
     ]
 
 
@@ -704,6 +811,14 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     elif name == "coverage_hints":
         repo_paths = _normalize_repo_paths(arguments)
         result     = await asyncio.to_thread(_tool_coverage_hints, repo_paths)
+
+    elif name == "find_similar":
+        repo_paths = _normalize_repo_paths(arguments)
+        db_paths   = _normalize_db_paths(arguments, repo_paths)
+        symbol     = arguments.get("symbol")
+        snippet    = arguments.get("snippet")
+        top_k      = int(arguments.get("top_k", 8))
+        result     = await asyncio.to_thread(_tool_find_similar, repo_paths, db_paths, symbol, snippet, top_k)
 
     else:
         result = f"Unknown tool: {name}"
