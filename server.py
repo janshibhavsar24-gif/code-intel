@@ -7,6 +7,7 @@ Tools:
   change_impact  — blast radius for a given node ID (single or multi-repo)
   find_usages    — all call sites of a symbol across one or more repos
   explain_code   — plain-English walkthrough of a file or line range
+  coverage_hints — identify untested files and functions
 
 Transport: stdio (works with Claude Desktop, Cursor, VS Code + MCP extension)
 
@@ -416,6 +417,105 @@ def _tool_explain_code(repo_path: str, file_path: str,
     return msg.content[0].text
 
 
+# test file pattern — matches common conventions across Python and TS/TSX
+_TEST_PAT = re.compile(
+    r"(^|/)test_|_test\.(py|ts|tsx)$"
+    r"|\.spec\.(ts|tsx)$|\.test\.(ts|tsx)$"
+    r"|/tests/|/test/|/e2e/"
+)
+
+
+def _tool_coverage_hints(repo_paths: list[str]) -> str:
+    sections = []
+
+    for repo_path in repo_paths:
+        label = Path(repo_path).name
+        try:
+            G, node_map = _load_graph(repo_path)
+        except Exception as exc:
+            sections.append(f"## {label}\nFailed to load repo: {exc}\n")
+            continue
+
+        src_files  = sorted({
+            n.file for n in node_map.values()
+            if not _TEST_PAT.search(n.file)
+            and n.file.endswith((".py", ".ts", ".tsx"))
+        })
+        test_files = sorted({
+            n.file for n in node_map.values()
+            if _TEST_PAT.search(n.file)
+        })
+
+        # ── file-level coverage ───────────────────────────────────────────────
+        # A source file is "covered" if any test file contains its stem in its name
+        def _is_file_covered(src: str) -> bool:
+            stem = Path(src).stem.lower().lstrip("_")
+            return any(stem in Path(tf).name.lower() for tf in test_files)
+
+        uncovered_files = [f for f in src_files if not _is_file_covered(f)]
+
+        # ── symbol-level coverage ─────────────────────────────────────────────
+        # BFS from all test nodes following CALLS edges — everything reachable = tested
+        test_node_ids = {nid for nid, d in G.nodes(data=True) if _TEST_PAT.search(d.get("file", ""))}
+
+        tested: set[str] = set(test_node_ids)
+        frontier = list(test_node_ids)
+        while frontier:
+            nxt = []
+            for nid in frontier:
+                for successor in G.successors(nid):
+                    if successor not in tested:
+                        tested.add(successor)
+                        nxt.append(successor)
+            frontier = nxt
+
+        # untested = source functions/methods never reached from any test
+        scores = coupling_scores(G)
+        untested_symbols = sorted(
+            [
+                n for n in node_map.values()
+                if n.id not in tested
+                and not _TEST_PAT.search(n.file)
+                and n.kind.value in ("function", "method")
+            ],
+            key=lambda n: scores.get(n.id, 0),
+            reverse=True,   # most load-bearing first
+        )
+
+        # ── format output ─────────────────────────────────────────────────────
+        total_src  = len(src_files)
+        total_syms = sum(
+            1 for n in node_map.values()
+            if not _TEST_PAT.search(n.file) and n.kind.value in ("function", "method")
+        )
+        tested_syms = total_syms - len(untested_symbols)
+
+        lines = [
+            f"## {label}\n",
+            f"Test files detected: {len(test_files)}",
+            f"Source files: {total_src}  |  without a test file: {len(uncovered_files)}",
+            f"Functions/methods: {total_syms}  |  unreachable from tests: {len(untested_symbols)}",
+        ]
+
+        if uncovered_files:
+            lines.append(f"\n### Source files with no corresponding test file ({len(uncovered_files)})\n")
+            for f in uncovered_files[:30]:
+                lines.append(f"  {f}")
+            if len(uncovered_files) > 30:
+                lines.append(f"  … and {len(uncovered_files) - 30} more")
+
+        if untested_symbols:
+            lines.append(f"\n### Top untested functions/methods (by PageRank)\n")
+            for n in untested_symbols[:25]:
+                lines.append(f"  {n.file}:{n.start_line:<5}  {n.kind.value:<8}  {n.name}")
+            if len(untested_symbols) > 25:
+                lines.append(f"  … and {len(untested_symbols) - 25} more")
+
+        sections.append("\n".join(lines))
+
+    return "\n\n---\n\n".join(sections)
+
+
 # ── MCP tool registry ─────────────────────────────────────────────────────────
 
 _REPO_PATHS_SCHEMA = {
@@ -552,6 +652,23 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["repo_path", "file_path"],
             },
         ),
+        types.Tool(
+            name="coverage_hints",
+            description=(
+                "Identify gaps in test coverage across one or more repos. "
+                "Reports: (1) source files with no corresponding test file, "
+                "(2) functions and methods never reachable from any test via BFS on the call graph, "
+                "ranked by PageRank so the most critical untested code surfaces first. "
+                "Does not require embed.py — works from source alone."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_paths": _REPO_PATHS_SCHEMA,
+                    "repo_path":  {"type": "string", "description": "Alias for repo_paths (single repo)."},
+                },
+            },
+        ),
     ]
 
 
@@ -583,6 +700,10 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         start_line = arguments.get("start_line")
         end_line   = arguments.get("end_line")
         result     = await asyncio.to_thread(_tool_explain_code, repo_path, file_path, start_line, end_line)
+
+    elif name == "coverage_hints":
+        repo_paths = _normalize_repo_paths(arguments)
+        result     = await asyncio.to_thread(_tool_coverage_hints, repo_paths)
 
     else:
         result = f"Unknown tool: {name}"
