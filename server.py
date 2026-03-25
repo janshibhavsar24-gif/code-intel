@@ -11,6 +11,7 @@ Tools:
   find_similar      — find semantically similar code via vector embeddings
   complexity_report — cyclomatic complexity ranked by risk
   generate_tests    — generate pytest/Jest test skeleton for a function or class
+  dependency_map    — external package usage report (single or multi-repo)
 
 Transport: stdio (works with Claude Desktop, Cursor, VS Code + MCP extension)
 
@@ -66,6 +67,7 @@ MAX_CONTEXT  = 20_000
 
 _graph_cache: dict[str, tuple]      = {}   # repo_path → (G, node_map)
 _coll_cache:  dict[tuple, Any]      = {}   # (repo_path, db_path) → collection
+_files_cache: dict[str, list]       = {}   # repo_path → list[ParsedFile]
 
 
 def _load_graph(repo_path: str) -> tuple:
@@ -75,8 +77,16 @@ def _load_graph(repo_path: str) -> tuple:
         nodes, edges = resolve(files)
         G            = build_graph(nodes, edges)
         node_map     = {n.id: n for n in nodes}
-        _graph_cache[key] = (G, node_map)
+        _graph_cache[key]  = (G, node_map)
+        _files_cache[key]  = files
     return _graph_cache[key]
+
+
+def _load_files(repo_path: str) -> list:
+    key = str(Path(repo_path).resolve())
+    if key not in _files_cache:
+        _load_graph(repo_path)   # populates both caches
+    return _files_cache[key]
 
 
 def _load_collection(repo_path: str, db_path: str) -> Any:
@@ -741,6 +751,96 @@ def _tool_coverage_hints(repo_paths: list[str]) -> str:
     return "\n\n---\n\n".join(sections)
 
 
+# ── dependency map ────────────────────────────────────────────────────────────
+
+import sys as _sys
+_STDLIB = getattr(_sys, "stdlib_module_names", frozenset())
+
+
+def _is_external_py(dotted: str, repo_names: set[str]) -> bool:
+    """True if a Python import is an external (third-party) package."""
+    if dotted.startswith("."):
+        return False
+    top = dotted.split(".")[0]
+    if top in _STDLIB:
+        return False
+    return top not in repo_names
+
+
+def _is_external_ts(source: str) -> bool:
+    """True if a TypeScript import path is an external package."""
+    return not source.startswith((".", "/", "@/", "~/", "#"))
+
+
+def _pkg_name_ts(source: str) -> str:
+    """Extract the npm package name from a TS import path."""
+    if source.startswith("@"):
+        parts = source.split("/")
+        return "/".join(parts[:2]) if len(parts) >= 2 else source
+    return source.split("/")[0]
+
+
+def _tool_dependency_map(repo_paths: list[str]) -> str:
+    from collections import defaultdict
+
+    sections = []
+
+    for repo_path in repo_paths:
+        label = Path(repo_path).name
+        try:
+            files = _load_files(repo_path)
+        except Exception as exc:
+            sections.append(f"## {label}\nFailed to load repo: {exc}\n")
+            continue
+
+        # Build set of internal module/package names for Python classification
+        repo_names: set[str] = set()
+        for pf in files:
+            p = Path(pf.path)
+            repo_names.add(p.stem)
+            for part in p.parts[:-1]:   # add every parent dir as a potential package name
+                repo_names.add(part)
+
+        # package → { file → [imported symbols] }
+        deps: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+
+        for pf in files:
+            is_ts = pf.path.endswith((".ts", ".tsx"))
+            for alias, source in pf.imports:
+                if is_ts:
+                    if not _is_external_ts(source):
+                        continue
+                    pkg = _pkg_name_ts(source)
+                else:
+                    if not _is_external_py(source, repo_names):
+                        continue
+                    pkg = source.split(".")[0]
+
+                deps[pkg][pf.path].append(alias)
+
+        if not deps:
+            sections.append(f"## {label}\nNo external dependencies detected.\n")
+            continue
+
+        sorted_deps = sorted(deps.items(), key=lambda x: len(x[1]), reverse=True)
+
+        lines = [f"## {label} — {len(sorted_deps)} external package(s)\n"]
+        for pkg, file_map in sorted_deps:
+            file_count = len(file_map)
+            all_symbols = sorted({s for syms in file_map.values() for s in syms})
+            sym_preview = ", ".join(all_symbols[:6])
+            if len(all_symbols) > 6:
+                sym_preview += f", +{len(all_symbols) - 6} more"
+            lines.append(f"\n**{pkg}** — {file_count} file(s)  [{sym_preview}]")
+            for filepath in sorted(file_map):
+                syms = sorted(set(file_map[filepath]))
+                lines.append(f"  {filepath}  ({', '.join(syms[:4])}{'...' if len(syms) > 4 else ''})")
+
+        sections.append("\n".join(lines))
+
+    return "\n\n---\n\n".join(sections)
+
+
 # ── MCP tool registry ─────────────────────────────────────────────────────────
 
 _REPO_PATHS_SCHEMA = {
@@ -974,6 +1074,22 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["repo_path", "symbol"],
             },
         ),
+        types.Tool(
+            name="dependency_map",
+            description=(
+                "Show every external (third-party) package imported across one or more repos, "
+                "how many files use each package, and which symbols are imported. "
+                "Useful before upgrades, audits, or licence reviews. "
+                "Works on Python and TypeScript/TSX. Does not require embed.py."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_paths": _REPO_PATHS_SCHEMA,
+                    "repo_path":  {"type": "string", "description": "Alias for repo_paths (single repo)."},
+                },
+            },
+        ),
     ]
 
 
@@ -1028,6 +1144,10 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         symbol    = arguments["symbol"]
         file_path = arguments.get("file_path")
         result    = await asyncio.to_thread(_tool_generate_tests, repo_path, symbol, file_path)
+
+    elif name == "dependency_map":
+        repo_paths = _normalize_repo_paths(arguments)
+        result     = await asyncio.to_thread(_tool_dependency_map, repo_paths)
 
     else:
         result = f"Unknown tool: {name}"
