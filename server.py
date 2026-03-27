@@ -8,6 +8,8 @@ Tools:
   find_usages    — all call sites of a symbol across one or more repos
   explain_code   — plain-English walkthrough of a file or line range
   bug_magnet     — rank functions by composite bug-risk score (complexity + PageRank + coverage + churn)
+  code_review    — automated review of a git diff: blast radius, complexity delta, test gaps
+  debt_heatmap   — per-file technical debt score combining complexity, coverage, churn, and TODOs
   repo_summary   — high-level architecture summary of one or more repos
   coverage_hints — identify untested files and functions
   find_similar      — find semantically similar code via vector embeddings
@@ -963,6 +965,255 @@ def _tool_bug_magnet(repo_paths: list[str], top_n: int) -> str:
     return "\n\n---\n\n".join(sections)
 
 
+# ── code_review ───────────────────────────────────────────────────────────────
+
+def _git_diff(repo_path: str, base: str, head: str) -> str:
+    import subprocess
+    result = subprocess.run(
+        ["git", "-C", repo_path, "diff", f"{base}..{head}"],
+        capture_output=True, text=True, timeout=30,
+    )
+    return result.stdout
+
+
+def _changed_files(diff_text: str) -> list[str]:
+    """Extract relative file paths touched by the diff."""
+    import re
+    return re.findall(r"^--- a/(.+)$", diff_text, re.MULTILINE)
+
+
+def _changed_line_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]]:
+    """
+    Parse unified diff to get (start, end) line ranges of changed hunks per file.
+    Returns {rel_path: [(start_line, end_line), ...]}.
+    """
+    import re
+    result: dict[str, list[tuple[int, int]]] = {}
+    current_file = None
+    for line in diff_text.splitlines():
+        m = re.match(r"^\+\+\+ b/(.+)$", line)
+        if m:
+            current_file = m.group(1)
+            result.setdefault(current_file, [])
+            continue
+        m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)
+        if m and current_file:
+            start = int(m.group(1))
+            count = int(m.group(2)) if m.group(2) else 1
+            result[current_file].append((start, start + count))
+    return result
+
+
+def _tool_code_review(repo_path: str, base: str, head: str) -> str:
+    import networkx as nx
+
+    try:
+        diff_text = _git_diff(repo_path, base, head)
+    except Exception as exc:
+        return f"git diff failed: {exc}"
+
+    if not diff_text.strip():
+        return f"No differences found between `{base}` and `{head}`."
+
+    try:
+        G, node_map = _load_graph(repo_path)
+    except Exception as exc:
+        return f"Failed to load repo: {exc}"
+
+    pr_scores    = coupling_scores(G)
+    line_ranges  = _changed_line_ranges(diff_text)
+    changed_files = set(line_ranges.keys())
+
+    # ── find nodes overlapping changed lines ───────────────────────────────────
+    changed_nodes: list = []
+    for nid, n in node_map.items():
+        if n.file not in changed_files:
+            continue
+        for start, end in line_ranges.get(n.file, []):
+            if n.start_line <= end and n.end_line >= start:
+                changed_nodes.append(n)
+                break
+
+    # ── test reachability ──────────────────────────────────────────────────────
+    test_nids = {
+        nid for nid, d in G.nodes(data=True)
+        if _TEST_PAT.search(d.get("file", ""))
+    }
+    tested: set[str] = set()
+    for tnid in test_nids:
+        reached = nx.single_source_shortest_path_length(G, tnid, cutoff=5)
+        tested.update(reached.keys())
+
+    # ── blast radius across changed nodes ─────────────────────────────────────
+    all_affected: set[str] = set()
+    for n in changed_nodes:
+        nid = n.id
+        if nid in G:
+            affected = change_impact(G, nid)
+            all_affected.update(affected)
+    all_affected -= {n.id for n in changed_nodes}
+
+    # ── build summary context ──────────────────────────────────────────────────
+    diff_preview = diff_text[:6000]
+
+    changed_summary_lines = []
+    for n in sorted(changed_nodes, key=lambda x: pr_scores.get(x.id, 0), reverse=True):
+        cc       = _complexity(n)
+        is_tested = "covered" if n.id in tested else "NOT covered by tests"
+        pr        = pr_scores.get(n.id, 0)
+        changed_summary_lines.append(
+            f"  - `{n.name}` ({n.file}:{n.start_line})  CC={cc}  PageRank={pr:.4f}  tests={is_tested}"
+        )
+
+    affected_lines = [
+        f"  - {node_map[nid].file}:{node_map[nid].start_line}  {node_map[nid].name}"
+        for nid in sorted(all_affected)[:15]
+        if nid in node_map
+    ]
+
+    context = f"""Repo: {Path(repo_path).name}  ({base}..{head})
+
+## Changed functions/methods ({len(changed_nodes)} total)
+{chr(10).join(changed_summary_lines) or '  none detected'}
+
+## Blast radius — nodes that transitively depend on changed code ({len(all_affected)} total)
+{chr(10).join(affected_lines) or '  none'}
+
+## Git diff (first 6000 chars)
+{diff_preview}
+"""
+
+    client = anthropic.Anthropic()
+    msg = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1500,
+        system=(
+            "You are an expert code reviewer. Given a git diff and structural analysis "
+            "(changed functions, their complexity and test coverage, blast radius), "
+            "write a concise Markdown code review. Cover: summary of what changed, "
+            "risk assessment, untested code warnings, blast radius concerns, "
+            "and concrete suggestions. Be specific — cite function names and file paths."
+        ),
+        messages=[{"role": "user", "content": f"Review this change:\n\n{context}"}],
+    )
+    return msg.content[0].text
+
+
+# ── debt_heatmap ───────────────────────────────────────────────────────────────
+
+def _todo_count(source: str) -> int:
+    import re
+    return len(re.findall(r"\b(TODO|FIXME|HACK|XXX)\b", source, re.IGNORECASE))
+
+
+def _tool_debt_heatmap(repo_paths: list[str], top_n: int) -> str:
+    import networkx as nx
+    from collections import defaultdict
+
+    sections = []
+
+    for repo_path in repo_paths:
+        label = Path(repo_path).name
+        try:
+            G, node_map = _load_graph(repo_path)
+            files       = _load_files(repo_path)
+        except Exception as exc:
+            sections.append(f"## {label}\nFailed to load: {exc}")
+            continue
+
+        pr_scores = coupling_scores(G)
+        churn_map = _git_churn(repo_path)
+
+        # ── test reachability ──────────────────────────────────────────────────
+        test_nids = {
+            nid for nid, d in G.nodes(data=True)
+            if _TEST_PAT.search(d.get("file", ""))
+        }
+        tested: set[str] = set()
+        for tnid in test_nids:
+            reached = nx.single_source_shortest_path_length(G, tnid, cutoff=5)
+            tested.update(reached.keys())
+
+        # ── group non-test function/method nodes by file ───────────────────────
+        file_fn_nodes: dict[str, list] = defaultdict(list)
+        for nid, n in node_map.items():
+            if G.nodes[nid].get("kind") in ("function", "method") and not _TEST_PAT.search(n.file):
+                file_fn_nodes[n.file].append((nid, n))
+
+        # ── per-file module node (for TODO count + source) ─────────────────────
+        module_nodes: dict[str, object] = {}
+        for nid, n in node_map.items():
+            if G.nodes[nid].get("kind") == "module" and not _TEST_PAT.search(n.file):
+                module_nodes[n.file] = n
+
+        # ── score each file ────────────────────────────────────────────────────
+        file_scores: dict[str, dict] = {}
+        for filepath, fn_list in file_fn_nodes.items():
+            if not fn_list:
+                continue
+            cc_values   = [_complexity(n) for _, n in fn_list]
+            avg_cc      = sum(cc_values) / len(cc_values)
+            untested_pct = sum(1 for nid, _ in fn_list if nid not in tested) / len(fn_list)
+            dead_pct     = sum(1 for nid, _ in fn_list if G.in_degree(nid) == 0) / len(fn_list)
+            churn        = float(churn_map.get(filepath, 0))
+            mod          = module_nodes.get(filepath)
+            todos        = _todo_count(mod.source) if mod else 0
+
+            file_scores[filepath] = {
+                "avg_cc":        avg_cc,
+                "untested_pct":  untested_pct,
+                "dead_pct":      dead_pct,
+                "churn":         churn,
+                "todos":         float(todos),
+                "fn_count":      len(fn_list),
+            }
+
+        if not file_scores:
+            sections.append(f"## {label}\nNo source files found.")
+            continue
+
+        # ── normalise and combine ──────────────────────────────────────────────
+        def _col(key: str) -> dict[str, float]:
+            return _normalize_signal({f: v[key] for f, v in file_scores.items()})
+
+        norm_cc      = _col("avg_cc")
+        norm_churn   = _col("churn")
+        norm_todos   = _col("todos")
+
+        # weights: avg_cc 25% · untested 35% · dead_code 15% · churn 15% · todos 10%
+        debt: dict[str, float] = {
+            fp: (
+                0.25 * norm_cc.get(fp, 0)
+                + 0.35 * v["untested_pct"]
+                + 0.15 * v["dead_pct"]
+                + 0.15 * norm_churn.get(fp, 0)
+                + 0.10 * norm_todos.get(fp, 0)
+            )
+            for fp, v in file_scores.items()
+        }
+
+        ranked = sorted(debt.items(), key=lambda x: x[1], reverse=True)[:top_n]
+
+        lines = [
+            f"## {label} — Technical Debt Heatmap  (top {top_n})\n",
+            "Weights: avg complexity 25% · untested 35% · dead code 15% · churn 15% · TODOs 10%\n",
+            f"{'#':<4} {'Score':<7} {'AvgCC':<7} {'Untested':<10} {'Dead':<7} {'Churn':<7} {'TODOs':<7} File",
+            "-" * 90,
+        ]
+
+        for i, (fp, score) in enumerate(ranked, 1):
+            v     = file_scores[fp]
+            risk  = "HIGH  " if score > 0.66 else ("MED   " if score > 0.33 else "low   ")
+            lines.append(
+                f"{i:<4} {score:.3f}  {v['avg_cc']:<7.1f} {v['untested_pct']*100:<10.0f}% "
+                f"{v['dead_pct']*100:<7.0f}% {int(v['churn']):<7} {int(v['todos']):<7} [{risk}] {fp}"
+            )
+
+        sections.append("\n".join(lines))
+
+    return "\n\n---\n\n".join(sections)
+
+
 # ── repo_summary ──────────────────────────────────────────────────────────────
 
 def _tool_repo_summary(repo_paths: list[str]) -> str:
@@ -1348,6 +1599,43 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="code_review",
+            description=(
+                "Automated code review of a git diff. "
+                "Identifies which functions changed, their complexity and test coverage, "
+                "the blast radius (what else depends on the changed code), "
+                "and produces a structured Markdown review with risk assessment and suggestions. "
+                "Defaults to reviewing the latest commit (HEAD~1..HEAD)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_path": {"type": "string", "description": "Absolute path to the repo root."},
+                    "base": {"type": "string", "description": "Base git ref (default: HEAD~1)."},
+                    "head": {"type": "string", "description": "Head git ref (default: HEAD)."},
+                },
+                "required": ["repo_path"],
+            },
+        ),
+        types.Tool(
+            name="debt_heatmap",
+            description=(
+                "Rank every source file by a composite technical debt score. "
+                "Combines: average cyclomatic complexity (25%), untested function % (35%), "
+                "dead code % (15%), git churn (15%), and TODO/FIXME count (10%). "
+                "Shows exactly where your accumulated debt is highest. "
+                "Does not require embed.py."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_paths": _REPO_PATHS_SCHEMA,
+                    "repo_path":  {"type": "string", "description": "Alias for repo_paths (single repo)."},
+                    "top_n": {"type": "integer", "description": "Number of files to show (default: 20)."},
+                },
+            },
+        ),
+        types.Tool(
             name="bug_magnet",
             description=(
                 "Rank functions and methods by their likelihood of containing bugs. "
@@ -1444,6 +1732,17 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     elif name == "dependency_map":
         repo_paths = _normalize_repo_paths(arguments)
         result     = await asyncio.to_thread(_tool_dependency_map, repo_paths)
+
+    elif name == "code_review":
+        repo_path = arguments["repo_path"]
+        base      = arguments.get("base", "HEAD~1")
+        head      = arguments.get("head", "HEAD")
+        result    = await asyncio.to_thread(_tool_code_review, repo_path, base, head)
+
+    elif name == "debt_heatmap":
+        repo_paths = _normalize_repo_paths(arguments)
+        top_n      = int(arguments.get("top_n", 20))
+        result     = await asyncio.to_thread(_tool_debt_heatmap, repo_paths, top_n)
 
     elif name == "bug_magnet":
         repo_paths = _normalize_repo_paths(arguments)
