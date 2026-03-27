@@ -7,6 +7,7 @@ Tools:
   change_impact  — blast radius for a given node ID (single or multi-repo)
   find_usages    — all call sites of a symbol across one or more repos
   explain_code   — plain-English walkthrough of a file or line range
+  bug_magnet     — rank functions by composite bug-risk score (complexity + PageRank + coverage + churn)
   repo_summary   — high-level architecture summary of one or more repos
   coverage_hints — identify untested files and functions
   find_similar      — find semantically similar code via vector embeddings
@@ -842,6 +843,126 @@ def _tool_dependency_map(repo_paths: list[str]) -> str:
     return "\n\n---\n\n".join(sections)
 
 
+# ── bug_magnet ────────────────────────────────────────────────────────────────
+
+def _git_churn(repo_path: str) -> dict[str, int]:
+    """Return commit-count per relative file path using git log."""
+    import subprocess
+    from collections import defaultdict
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo_path, "log", "--format=", "--name-only"],
+            capture_output=True, text=True, timeout=30,
+        )
+        counts: dict[str, int] = defaultdict(int)
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line:
+                counts[line] += 1
+        return dict(counts)
+    except Exception:
+        return {}
+
+
+def _normalize_signal(d: dict[str, float]) -> dict[str, float]:
+    if not d:
+        return d
+    lo, hi = min(d.values()), max(d.values())
+    if hi == lo:
+        return {k: 0.0 for k in d}
+    return {k: (v - lo) / (hi - lo) for k, v in d.items()}
+
+
+def _tool_bug_magnet(repo_paths: list[str], top_n: int) -> str:
+    import networkx as nx
+
+    sections = []
+
+    for repo_path in repo_paths:
+        label = Path(repo_path).name
+        try:
+            G, node_map = _load_graph(repo_path)
+        except Exception as exc:
+            sections.append(f"## {label}\nFailed to load: {exc}")
+            continue
+
+        pr_scores = coupling_scores(G)
+        churn_map = _git_churn(repo_path)
+
+        # ── test reachability via BFS from test nodes ──────────────────────────
+        test_nids = {
+            nid for nid, d in G.nodes(data=True)
+            if _TEST_PAT.search(d.get("file", ""))
+        }
+        tested: set[str] = set()
+        for tnid in test_nids:
+            reached = nx.single_source_shortest_path_length(G, tnid, cutoff=5)
+            tested.update(reached.keys())
+
+        # ── candidate nodes: non-test functions/methods ────────────────────────
+        candidates = [
+            nid for nid in G.nodes()
+            if G.nodes[nid].get("kind") in ("function", "method")
+            and nid in node_map
+            and not _TEST_PAT.search(G.nodes[nid].get("file", ""))
+        ]
+
+        if not candidates:
+            sections.append(f"## {label}\nNo non-test functions found.")
+            continue
+
+        # ── raw signals ────────────────────────────────────────────────────────
+        raw_cc     = {nid: float(_complexity(node_map[nid]))         for nid in candidates}
+        raw_pr     = {nid: pr_scores.get(nid, 0.0)                   for nid in candidates}
+        raw_churn  = {nid: float(churn_map.get(node_map[nid].file, 0)) for nid in candidates}
+        raw_untested = {nid: 0.0 if nid in tested else 1.0           for nid in candidates}
+
+        # ── normalise to [0, 1] ────────────────────────────────────────────────
+        norm_cc    = _normalize_signal(raw_cc)
+        norm_pr    = _normalize_signal(raw_pr)
+        norm_churn = _normalize_signal(raw_churn)
+
+        # ── weighted composite score ───────────────────────────────────────────
+        # complexity 30%  ·  PageRank 25%  ·  untested 30%  ·  churn 15%
+        bug_scores: dict[str, float] = {
+            nid: (
+                0.30 * norm_cc.get(nid, 0)
+                + 0.25 * norm_pr.get(nid, 0)
+                + 0.30 * raw_untested[nid]
+                + 0.15 * norm_churn.get(nid, 0)
+            )
+            for nid in candidates
+        }
+
+        ranked = sorted(bug_scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
+
+        # ── format ─────────────────────────────────────────────────────────────
+        has_churn = any(raw_churn.values())
+        lines = [
+            f"## {label} — Bug Magnet Score  (top {top_n})\n",
+            f"Weights: complexity 30% · PageRank 25% · untested 30% · git churn 15%"
+            + ("" if has_churn else "  [churn unavailable — not a git repo]"),
+            "",
+            f"{'#':<4} {'Score':<7} {'CC':<5} {'Churn':<7} {'Tested':<8} {'Risk':<7} Location",
+            "-" * 85,
+        ]
+
+        for i, (nid, score) in enumerate(ranked, 1):
+            n      = node_map[nid]
+            cc     = int(raw_cc[nid])
+            churn  = int(raw_churn[nid])
+            tested = "yes" if nid in tested else "NO"
+            risk   = "HIGH  " if score > 0.66 else ("MED   " if score > 0.33 else "low   ")
+            lines.append(
+                f"{i:<4} {score:.3f}  {cc:<5} {churn:<7} {tested:<8} {risk} "
+                f"{n.file}:{n.start_line}  {n.name}"
+            )
+
+        sections.append("\n".join(lines))
+
+    return "\n\n---\n\n".join(sections)
+
+
 # ── repo_summary ──────────────────────────────────────────────────────────────
 
 def _tool_repo_summary(repo_paths: list[str]) -> str:
@@ -1227,6 +1348,28 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="bug_magnet",
+            description=(
+                "Rank functions and methods by their likelihood of containing bugs. "
+                "Combines four signals into one composite score: "
+                "cyclomatic complexity (30%), PageRank/load-bearing score (25%), "
+                "lack of test coverage (30%), and git churn — how often the file changes (15%). "
+                "High-scoring functions are your highest-priority refactor targets. "
+                "Does not require embed.py. Git churn requires the repo to be a git repository."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_paths": _REPO_PATHS_SCHEMA,
+                    "repo_path":  {"type": "string", "description": "Alias for repo_paths (single repo)."},
+                    "top_n": {
+                        "type": "integer",
+                        "description": "Number of functions to show (default: 20).",
+                    },
+                },
+            },
+        ),
+        types.Tool(
             name="repo_summary",
             description=(
                 "Generate a high-level architecture summary of one or more codebases. "
@@ -1301,6 +1444,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     elif name == "dependency_map":
         repo_paths = _normalize_repo_paths(arguments)
         result     = await asyncio.to_thread(_tool_dependency_map, repo_paths)
+
+    elif name == "bug_magnet":
+        repo_paths = _normalize_repo_paths(arguments)
+        top_n      = int(arguments.get("top_n", 20))
+        result     = await asyncio.to_thread(_tool_bug_magnet, repo_paths, top_n)
 
     elif name == "repo_summary":
         repo_paths = _normalize_repo_paths(arguments)
