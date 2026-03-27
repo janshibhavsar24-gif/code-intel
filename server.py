@@ -7,6 +7,7 @@ Tools:
   change_impact  — blast radius for a given node ID (single or multi-repo)
   find_usages    — all call sites of a symbol across one or more repos
   explain_code   — plain-English walkthrough of a file or line range
+  repo_summary   — high-level architecture summary of one or more repos
   coverage_hints — identify untested files and functions
   find_similar      — find semantically similar code via vector embeddings
   complexity_report — cyclomatic complexity ranked by risk
@@ -841,6 +842,141 @@ def _tool_dependency_map(repo_paths: list[str]) -> str:
     return "\n\n---\n\n".join(sections)
 
 
+# ── repo_summary ──────────────────────────────────────────────────────────────
+
+def _tool_repo_summary(repo_paths: list[str]) -> str:
+    from collections import Counter, defaultdict
+
+    sections = []
+
+    for repo_path in repo_paths:
+        label = Path(repo_path).name
+        try:
+            G, node_map = _load_graph(repo_path)
+            files       = _load_files(repo_path)
+        except Exception as exc:
+            sections.append(f"## {label}\nFailed to load repo: {exc}\n")
+            continue
+
+        # ── stats ──────────────────────────────────────────────────────────────
+        py_files = [pf for pf in files if pf.path.endswith(".py")]
+        ts_files = [pf for pf in files if pf.path.endswith((".ts", ".tsx"))]
+        kind_counts = Counter(G.nodes[nid].get("kind") for nid in G.nodes())
+        scores = coupling_scores(G)
+
+        # ── top modules by PageRank ────────────────────────────────────────────
+        module_nids = [nid for nid in G.nodes() if G.nodes[nid].get("kind") == "module"]
+        top_modules = sorted(module_nids, key=lambda nid: scores.get(nid, 0), reverse=True)[:10]
+
+        # ── entry points (module nodes with in-degree 0) ───────────────────────
+        entry_points = [nid for nid in module_nids if G.in_degree(nid) == 0][:10]
+
+        # ── top classes by method count ────────────────────────────────────────
+        method_count: dict[str, int] = defaultdict(int)
+        for nid in G.nodes():
+            if G.nodes[nid].get("kind") == "method":
+                parts = nid.rsplit("::", 1)
+                if len(parts) == 2:
+                    method_count[parts[0]] += 1
+        top_classes = sorted(method_count.items(), key=lambda x: x[1], reverse=True)[:8]
+
+        # ── directory tree (top 2 levels) ──────────────────────────────────────
+        dirs: set[str] = set()
+        for pf in files:
+            parts = Path(pf.path).parts
+            if parts:
+                dirs.add(parts[0])
+            if len(parts) >= 2:
+                dirs.add(str(Path(parts[0]) / parts[1]))
+        dir_tree = "\n".join(f"  {d}/" for d in sorted(dirs))
+
+        # ── external dependencies ──────────────────────────────────────────────
+        repo_names: set[str] = set()
+        for pf in files:
+            p = Path(pf.path)
+            repo_names.add(p.stem)
+            for part in p.parts[:-1]:
+                repo_names.add(part)
+
+        ext_pkgs: set[str] = set()
+        for pf in files:
+            is_ts = pf.path.endswith((".ts", ".tsx"))
+            for _, source in pf.imports:
+                if is_ts:
+                    if _is_external_ts(source):
+                        ext_pkgs.add(_pkg_name_ts(source))
+                else:
+                    if _is_external_py(source, repo_names):
+                        ext_pkgs.add(source.split(".")[0])
+
+        # ── docstrings from top-ranked nodes ───────────────────────────────────
+        top_docs = []
+        for nid, _ in sorted(
+            [(nid, scores.get(nid, 0)) for nid in G.nodes()
+             if G.nodes[nid].get("kind") in ("function", "method", "class")],
+            key=lambda x: x[1], reverse=True,
+        )[:20]:
+            n = node_map.get(nid)
+            if n and n.docstring:
+                top_docs.append(f"- `{n.name}` ({n.file}:{n.start_line}): {n.docstring[:120]}")
+            if len(top_docs) >= 10:
+                break
+
+        # ── source samples from top modules ────────────────────────────────────
+        samples = []
+        for nid in top_modules[:5]:
+            n = node_map.get(nid)
+            if n:
+                samples.append(f"### {n.file}\n{n.source[:600]}")
+
+        context = f"""Repo: {label}  ({repo_path})
+
+## Directory structure (top 2 levels)
+{dir_tree}
+
+## Stats
+- Python files: {len(py_files)}  |  TypeScript/TSX files: {len(ts_files)}
+- Nodes: {kind_counts.get('module', 0)} modules, {kind_counts.get('class', 0)} classes, {kind_counts.get('function', 0)} functions, {kind_counts.get('method', 0)} methods
+- Graph edges: {G.number_of_edges()}
+
+## Top modules by load (PageRank)
+{chr(10).join(f'  {node_map[nid].file}' for nid in top_modules if nid in node_map)}
+
+## Entry points (not imported by anything)
+{chr(10).join(f'  {node_map[nid].file}' for nid in entry_points if nid in node_map)}
+
+## Top classes by method count
+{chr(10).join(f'  {cls} ({n} methods)' for cls, n in top_classes)}
+
+## External dependencies
+{', '.join(sorted(ext_pkgs)) if ext_pkgs else 'none detected'}
+
+## Key docstrings
+{chr(10).join(top_docs) if top_docs else 'none found'}
+
+## Source samples (top modules)
+{chr(10).join(samples)}
+"""
+
+        client = anthropic.Anthropic()
+        msg = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            system=(
+                "You are a senior software architect. Given metadata and source samples "
+                "from a codebase, write a concise, insightful high-level summary in Markdown. "
+                "Structure it with these sections: What it does, Architecture, Key modules "
+                "and their roles, Notable patterns, External dependencies. "
+                "Be specific: cite actual file names, class names, and function names. "
+                "Aim for 300-500 words."
+            ),
+            messages=[{"role": "user", "content": f"Summarize this codebase:\n\n{context}"}],
+        )
+        sections.append(msg.content[0].text)
+
+    return "\n\n---\n\n".join(sections)
+
+
 # ── MCP tool registry ─────────────────────────────────────────────────────────
 
 _REPO_PATHS_SCHEMA = {
@@ -1090,6 +1226,23 @@ async def list_tools() -> list[types.Tool]:
                 },
             },
         ),
+        types.Tool(
+            name="repo_summary",
+            description=(
+                "Generate a high-level architecture summary of one or more codebases. "
+                "Covers: what the repo does, directory structure, key modules and their roles, "
+                "top classes, entry points, notable patterns, and external dependencies. "
+                "Uses Claude to synthesize the analysis into a readable Markdown document. "
+                "Does not require embed.py — works from source alone."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_paths": _REPO_PATHS_SCHEMA,
+                    "repo_path":  {"type": "string", "description": "Alias for repo_paths (single repo)."},
+                },
+            },
+        ),
     ]
 
 
@@ -1148,6 +1301,10 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     elif name == "dependency_map":
         repo_paths = _normalize_repo_paths(arguments)
         result     = await asyncio.to_thread(_tool_dependency_map, repo_paths)
+
+    elif name == "repo_summary":
+        repo_paths = _normalize_repo_paths(arguments)
+        result     = await asyncio.to_thread(_tool_repo_summary, repo_paths)
 
     else:
         result = f"Unknown tool: {name}"
